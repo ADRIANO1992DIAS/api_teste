@@ -5,16 +5,15 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 import base64, json, io
 
-# ReportLab para gerar PDF em memória
+# ReportLab para gerar PDF
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
-app = FastAPI(title="Mock SERPRO PGDAS-D", version="1.1.0")
+app = FastAPI(title="Mock SERPRO PGDAS-D", version="1.2.0")
 
-# --------------- utils ---------------
-
-def pdf_bytes_from_text(lines: List[str]) -> bytes:
+# ------------ utils ------------
+def pdf_b64_from_text(lines: List[str]) -> str:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -32,11 +31,7 @@ def pdf_bytes_from_text(lines: List[str]) -> bytes:
     c.showPage()
     c.save()
     buf.seek(0)
-    return buf.read()
-
-def pdf_b64_from_text(lines: List[str]) -> str:
-    data = pdf_bytes_from_text(lines)
-    return base64.b64encode(data).decode("utf-8")
+    return base64.b64encode(buf.read()).decode("utf-8")
 
 def ok_payload(dados_obj: Dict[str, Any], mensagens: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     return {"mensagens": mensagens or [], "dados": json.dumps(dados_obj)}
@@ -45,19 +40,16 @@ def get_effective_jwt_token(request: Request, jwt_token_param: Optional[str]) ->
     if jwt_token_param:
         return jwt_token_param
     h = request.headers
-    # Starlette normaliza para minúsculas; tentamos variações por compatibilidade
     return h.get("jwt-token") or h.get("jwt_token") or h.get("Jwt-Token") or h.get("Jwt_Token")
 
-# --------------- modelos ---------------
-
+# ------------ modelos ------------
 class AuthenticateResponse(BaseModel):
     access_token: str
     jwt_token: str
     token_type: str = "bearer"
     expires_in: int = 3600
 
-# --------------- rotas ---------------
-
+# ------------ rotas ------------
 @app.post("/authenticate")
 def authenticate(
     authorization: Optional[str] = Header(None),
@@ -92,9 +84,11 @@ async def declarar(
         pedido = body["pedidoDados"]
         dados_str = pedido["dados"]
         dados = json.loads(dados_str)
+
         cnpj = dados.get("cnpjCompleto")
         pa = dados.get("pa")
         declaracao = dados.get("declaracao", {}) or {}
+
         tipo_declaracao = declaracao.get("tipoDeclaracao")
         receita_interno = declaracao.get("receitaPaCompetenciaInterno")
         receita_externo = declaracao.get("receitaPaCompetenciaExterno")
@@ -105,15 +99,15 @@ async def declarar(
     agora = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     id_declaracao = f"DEC-{cnpj}-{pa}-{agora}"
 
-    # PDFs com conteúdo do body
+    # Linhas com o valor solicitado (receitaPaCompetenciaInterno)
     lines_common = [
-        f"PGDAS-D MOCK - Declaracao",
+        "PGDAS-D MOCK - Declaracao",
         f"ID Declaracao: {id_declaracao}",
         f"CNPJ: {cnpj}",
         f"PA: {pa}",
         f"Tipo Declaracao: {tipo_declaracao}",
-        f"Receita Interno: {receita_interno}",
-        f"Receita Externo: {receita_externo}",
+        f"Receita Interno (PA): {receita_interno}",   # <<<<<<<<<<<< linha adicionada explicitamente
+        f"Receita Externo (PA): {receita_externo}",
         f"Folhas Salario (qtd): {len(folhas)}",
     ]
     if folhas:
@@ -156,12 +150,12 @@ async def emitir(
         dados_str = pedido["dados"]
         dados = json.loads(dados_str)
         pa = dados.get("periodoApuracao")
-        cnpj_contrib = body.get("contribuinte", {}).get("numero") or body.get("contribuinte", {}).get("cnpj")  # caso exista
-        # também aceitar que não venha contribuinte no Emitir; se não vier, fica None
+
+        # tentar obter CNPJ do contribuinte no envelope; se não vier, fica None
+        cnpj_contrib = body.get("contribuinte", {}).get("numero") or body.get("contribuinte", {}).get("cnpj")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid body structure: {e}")
 
-    # PDF do DAS com informações recebidas (CNPJ, PA)
     das_lines = [
         "PGDAS-D MOCK - DAS",
         f"CNPJ Contribuinte: {cnpj_contrib}",
@@ -170,9 +164,5 @@ async def emitir(
     ]
     das_pdf_b64 = pdf_b64_from_text(das_lines)
 
-    das_item = {
-        "id": f"DAS-{pa}",
-        "pdf": das_pdf_b64,
-    }
-    # seu cliente aceita lista ou item único; retornamos lista
+    das_item = {"id": f"DAS-{pa}", "pdf": das_pdf_b64}
     return JSONResponse(content=ok_payload([das_item]))
