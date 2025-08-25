@@ -1,0 +1,8 @@
+version: "3.8"
+services:
+  mock-serpro:
+    build: .
+    container_name: mock-serpro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
