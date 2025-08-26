@@ -1,18 +1,68 @@
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import base64, json, io
+import os
 
-# ReportLab para gerar PDF
+# PDF
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
-app = FastAPI(title="Mock SERPRO PGDAS-D", version="1.2.0")
+# Banco
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Numeric
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import JSONB
 
-# ------------ utils ------------
+load_dotenv()
+
+DB_HOST = os.getenv("DB_HOST", "db")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "pgdasd")
+DB_USER = os.getenv("DB_USER", "app_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "pg_password")
+
+DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
+
+class DeclaracaoLog(Base):
+    __tablename__ = "declaracao_log"
+    id = Column(Integer, primary_key=True, index=True)
+    cnpj = Column(String(14), index=True, nullable=True)
+    pa = Column(String(6), index=True, nullable=True)
+    tipo_declaracao = Column(Integer, nullable=True)
+    receita_interno = Column(Numeric(18, 2), nullable=True)
+    receita_externo = Column(Numeric(18, 2), nullable=True)
+    payload = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+class DasLog(Base):
+    __tablename__ = "das_log"
+    id = Column(Integer, primary_key=True, index=True)
+    cnpj = Column(String(14), index=True, nullable=True)
+    pa = Column(String(6), index=True, nullable=True)
+    payload = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Mock SERPRO PGDAS-D", version="1.3.1")
+
+# Dependência de sessão (sem decorators que alteram assinatura)
+def get_db() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 def pdf_b64_from_text(lines: List[str]) -> str:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -42,14 +92,12 @@ def get_effective_jwt_token(request: Request, jwt_token_param: Optional[str]) ->
     h = request.headers
     return h.get("jwt-token") or h.get("jwt_token") or h.get("Jwt-Token") or h.get("Jwt_Token")
 
-# ------------ modelos ------------
 class AuthenticateResponse(BaseModel):
     access_token: str
     jwt_token: str
     token_type: str = "bearer"
     expires_in: int = 3600
 
-# ------------ rotas ------------
 @app.post("/authenticate")
 def authenticate(
     authorization: Optional[str] = Header(None),
@@ -66,12 +114,14 @@ def authenticate(
 
 @app.post("/integra-contador/v1/Declarar")
 async def declarar(
-    request: Request,
     body: Dict[str, Any],
+    request: Request,
     authorization: Optional[str] = Header(None),
     jwt_token: Optional[str] = Header(None, alias="jwt-token"),
     content_type: Optional[str] = Header(None, alias="Content-Type"),
+    db: Session = Depends(get_db),
 ):
+    # Headers
     effective_jwt = get_effective_jwt_token(request, jwt_token)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized: Bearer token missing")
@@ -80,6 +130,7 @@ async def declarar(
     if content_type != "application/json":
         raise HTTPException(status_code=400, detail="Content-Type must be application/json")
 
+    # Parse body
     try:
         pedido = body["pedidoDados"]
         dados_str = pedido["dados"]
@@ -96,17 +147,32 @@ async def declarar(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid body structure: {e}")
 
+    # Persistência
+    try:
+        reg = DeclaracaoLog(
+            cnpj=(cnpj or None),
+            pa=(str(pa) if pa is not None else None),
+            tipo_declaracao=tipo_declaracao,
+            receita_interno=receita_interno if receita_interno is not None else None,
+            receita_externo=receita_externo if receita_externo is not None else None,
+            payload=dados,
+        )
+        db.add(reg)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # PDFs simulados
     agora = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     id_declaracao = f"DEC-{cnpj}-{pa}-{agora}"
 
-    # Linhas com o valor solicitado (receitaPaCompetenciaInterno)
     lines_common = [
         "PGDAS-D MOCK - Declaracao",
         f"ID Declaracao: {id_declaracao}",
         f"CNPJ: {cnpj}",
         f"PA: {pa}",
         f"Tipo Declaracao: {tipo_declaracao}",
-        f"Receita Interno (PA): {receita_interno}",   # <<<<<<<<<<<< linha adicionada explicitamente
+        f"Receita Interno (PA): {receita_interno}",
         f"Receita Externo (PA): {receita_externo}",
         f"Folhas Salario (qtd): {len(folhas)}",
     ]
@@ -131,12 +197,14 @@ async def declarar(
 
 @app.post("/integra-contador/v1/Emitir")
 async def emitir(
-    request: Request,
     body: Dict[str, Any],
+    request: Request,
     authorization: Optional[str] = Header(None),
     jwt_token: Optional[str] = Header(None, alias="jwt-token"),
     content_type: Optional[str] = Header(None, alias="Content-Type"),
+    db: Session = Depends(get_db),
 ):
+    # Headers
     effective_jwt = get_effective_jwt_token(request, jwt_token)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized: Bearer token missing")
@@ -145,16 +213,27 @@ async def emitir(
     if content_type != "application/json":
         raise HTTPException(status_code=400, detail="Content-Type must be application/json")
 
+    # Parse body
     try:
         pedido = body["pedidoDados"]
         dados_str = pedido["dados"]
         dados = json.loads(dados_str)
         pa = dados.get("periodoApuracao")
-
-        # tentar obter CNPJ do contribuinte no envelope; se não vier, fica None
         cnpj_contrib = body.get("contribuinte", {}).get("numero") or body.get("contribuinte", {}).get("cnpj")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid body structure: {e}")
+
+    # Persistência
+    try:
+        reg = DasLog(
+            cnpj=(cnpj_contrib or None),
+            pa=(str(pa) if pa is not None else None),
+            payload=dados,
+        )
+        db.add(reg)
+        db.commit()
+    except Exception:
+        db.rollback()
 
     das_lines = [
         "PGDAS-D MOCK - DAS",
